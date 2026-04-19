@@ -82,11 +82,20 @@ def _find_jsonl_path(session_id):
 
 def count_turns(content):
     """统计对话轮次（用户消息数）"""
+    # 兼容两种格式：V3.3 "### 第N轮对话" 和旧版 "### N. 用户"
+    v33 = len(re.findall(r'^### 第\d+轮对话', content, re.MULTILINE))
+    if v33 > 0:
+        return v33
     return len(re.findall(r'^### \d+\. 用户', content, re.MULTILINE))
 
 
 def extract_first_user_message(content):
     """提取第一条用户消息"""
+    # V3.3 格式
+    match = re.search(r'^\*\*用户输入\*\*:\s*\n> (.+?)(?:\n\n|\n\*\*)', content, re.MULTILINE | re.DOTALL)
+    if match:
+        return match.group(1).strip()[:200]
+    # 旧版格式
     match = re.search(r'^### \d+\. 用户\s*\n> (.+?)(?:\n---|\n\n)', content, re.MULTILINE | re.DOTALL)
     if match:
         return match.group(1).strip()[:200]
@@ -116,13 +125,21 @@ def extract_document_outputs(content):
 
 
 def restructure_conversation(content):
-    """将提取脚本的消息格式转换为 V3.1 轮次格式"""
+    """将提取脚本的消息格式转换为 V3.3 轮次格式
+
+    V3.3 每轮对话包含4个强制子节：
+    - **用户输入**: 引用块格式
+    - **AI回复**: 完整文本
+    - **AI思考链**: 自动推断（标注为脚本生成，需人工审核）
+    - **工具调用示例**: 规范化列表格式
+    额外子节：
+    - **AI文档产出**: Write/Edit 的文件列表
+    - **参考文档**: AI回复中引用的文件路径
+    """
     lines = content.split('\n')
-    output = []
-    turn_num = 0
+    turns = []  # 收集每一轮的数据
+    current_turn = None
     current_role = None
-    current_content = []
-    tool_calls_block = []
 
     # 跳过提取脚本的头部
     header_end = False
@@ -133,81 +150,245 @@ def restructure_conversation(content):
         if not header_end:
             continue
 
-        # 检测角色切换
+        # 检测角色切换（兼容两种格式）
         role_match = re.match(r'^### \d+\. (用户|AI助手|记录)\s*$', line)
+        if not role_match:
+            # 也兼容 read-jsonl.py compact 模式：## 1. topic / ### 1.1. 用户输入
+            role_match = re.match(r'^### \d+\.\d+\. (用户输入|AI回复)\s*$', line)
+
         if role_match:
-            role = role_match.group(1)
+            role_label = role_match.group(1)
 
             # 跳过"记录"类型的系统消息
-            if role == '记录':
+            if role_label == '记录':
                 continue
 
-            if role == '用户' and current_role == 'AI助手':
-                # AI回合结束，输出工具调用示例和AI思考链
-                if tool_calls_block:
-                    output.append("")
-                    output.append(f"### {turn_num}.4. 工具调用示例")
-                    output.append("")
-                    for tc in tool_calls_block:
-                        output.append(f"**{tc}**")
-                        output.append("")
-                    tool_calls_block = []
-
-                output.append("")
-                output.append(f"### {turn_num}.3. AI思考链")
-                output.append("")
-                output.append("<!-- TODO: 根据本轮对话的实际执行过程填充，禁止使用通用占位符 -->")
-                output.append("")
-
-                turn_num += 1
-                output.append(f"## {turn_num}. 对话轮次 {turn_num}")
-                output.append("")
-            elif role == '用户' and current_role is None:
-                turn_num += 1
-                output.append(f"## {turn_num}. 对话轮次 {turn_num}")
-                output.append("")
-            elif role == 'AI助手' and current_role == '用户':
-                current_content = []
-
-            if role == '用户':
-                output.append(f"### {turn_num}.1. 用户输入")
-                output.append("")
-                current_role = '用户'
-            elif role == 'AI助手':
-                output.append(f"### {turn_num}.2. AI回复")
-                output.append("")
-                current_role = 'AI助手'
-            current_content = []
-        elif line.strip() == '---':
+            if '用户' in role_label:
+                # 保存上一轮
+                if current_turn is not None:
+                    turns.append(current_turn)
+                current_turn = {
+                    'user_lines': [],
+                    'ai_lines': [],
+                    'tool_calls': [],
+                    'doc_outputs': [],
+                    'ref_docs': [],
+                }
+                current_role = 'user'
+            elif 'AI' in role_label or 'ai' in role_label:
+                current_role = 'assistant'
             continue
+
+        if line.strip() == '---':
+            continue
+
+        # 过滤掉 read-jsonl.py 输出的工具调用标题行
+        if line.strip() == '**工具调用:**':
+            continue
+
+        if current_turn is None:
+            continue
+
+        # 收集工具调用（在 AI 回复中的 "- ToolName: description" 格式）
+        tc_match = re.match(
+            r'^- (Read|Edit|Write|Bash|Grep|Glob|Agent|Skill|TaskCreate|TaskUpdate|AskUserQuestion|TodoWrite|WebSearch|WebFetch|LSP|NotebookEdit|mcp__\S+): (.+)$',
+            line
+        )
+        if tc_match and current_role == 'assistant':
+            tool_name = tc_match.group(1)
+            tool_desc = tc_match.group(2).strip()
+            current_turn['tool_calls'].append((tool_name, tool_desc))
+
+            # 收集文档产出（Write/Edit 操作的文件路径）
+            if tool_name in ('Write', 'Edit'):
+                path_match = re.match(r'`([^`]+)`', tool_desc)
+                if path_match:
+                    current_turn['doc_outputs'].append(path_match.group(1))
+
+            # 收集参考文档（Read 操作的文件路径）
+            if tool_name == 'Read':
+                path_match = re.match(r'`([^`]+)`', tool_desc)
+                if path_match:
+                    current_turn['ref_docs'].append(path_match.group(1))
+
+            continue  # 工具调用行不归入 ai_lines
+
+        # 分发内容行到对应角色
+        if current_role == 'user':
+            current_turn['user_lines'].append(line)
+        elif current_role == 'assistant':
+            current_turn['ai_lines'].append(line)
+
+    # 保存最后一轮
+    if current_turn is not None:
+        turns.append(current_turn)
+
+    # 按轮次输出 V3.3 格式
+    output = []
+    for i, turn in enumerate(turns, 1):
+        output.append(f"### 第{i}轮对话")
+        output.append("")
+
+        # 用户输入
+        output.append("**用户输入**:")
+        user_text = '\n'.join(turn['user_lines']).strip()
+        # 如果内容不以 > 开头，自动添加引用前缀
+        if user_text and not user_text.startswith('>'):
+            for ul in user_text.split('\n'):
+                output.append(f"> {ul}")
         else:
-            # 收集工具调用
-            tc_match = re.match(
-                r'^- (Read|Edit|Write|Bash|Grep|Glob|Agent|Skill|TaskCreate|TaskUpdate|AskUserQuestion): (.+)$',
-                line
-            )
-            if tc_match and current_role == 'AI助手':
-                tool_calls_block.append(f"{tc_match.group(1)} - {tc_match.group(2)}")
-
-            output.append(line)
-
-    # 处理最后一个回合
-    if tool_calls_block:
+            output.append(user_text if user_text else "> （无文本输入）")
         output.append("")
-        output.append(f"### {turn_num}.4. 工具调用示例")
+
+        # AI回复
+        output.append("**AI回复**:")
+        ai_text = '\n'.join(turn['ai_lines']).strip()
+        if ai_text:
+            output.append(ai_text)
+        else:
+            output.append("（无文本回复）")
         output.append("")
-        for tc in tool_calls_block:
-            output.append(f"**{tc}**")
+
+        # AI文档产出
+        if turn['doc_outputs']:
+            output.append("**AI文档产出**:")
+            for doc in turn['doc_outputs']:
+                output.append(f"- `{doc}`")
             output.append("")
 
-    if turn_num > 0:
-        output.append("")
-        output.append(f"### {turn_num}.3. AI思考链")
-        output.append("")
-        output.append("<!-- TODO: 根据本轮对话的实际执行过程填充，禁止使用通用占位符 -->")
+        # AI思考链（基于工具调用自动推断）
+        output.append("**AI思考链**:")
+        output.append("> [脚本自动推断，需人工审核]")
+        _generate_thinking_chain(output, turn, i)
         output.append("")
 
-    return '\n'.join(output), turn_num
+        # 参考文档
+        if turn['ref_docs']:
+            output.append("**参考文档**:")
+            for ref in turn['ref_docs']:
+                output.append(f"- `{ref}`")
+            output.append("")
+
+        # 工具调用示例
+        output.append("**工具调用示例**:")
+        if turn['tool_calls']:
+            for tool_name, tool_desc in turn['tool_calls']:
+                desc_short = _summarize_tool_desc(tool_name, tool_desc)
+                output.append(f"- **{tool_name}**: {desc_short}")
+        else:
+            output.append("本轮无工具调用")
+        output.append("")
+
+        output.append("---")
+
+    return '\n'.join(output), len(turns)
+
+
+def _summarize_tool_desc(tool_name, tool_desc, max_len=80):
+    """智能截断工具调用描述
+
+    对 JSON 类参数提取简短摘要，而非简单截断。
+    """
+    desc = tool_desc.strip()
+    if len(desc) <= max_len:
+        return desc
+
+    # 对包含 JSON 参数的工具调用，提取摘要
+    if desc.startswith('{') or desc.startswith('['):
+        import json as _json
+        try:
+            obj = _json.loads(desc)
+            if isinstance(obj, dict):
+                # 对 todos 等列表类型参数，只提取数量
+                if 'todos' in obj and isinstance(obj['todos'], list):
+                    return f"更新 {len(obj['todos'])} 个待办事项"
+                # 取前2个键值对
+                parts = []
+                for k, v in list(obj.items())[:2]:
+                    v_str = str(v)[:30]
+                    parts.append(f"{k}={v_str}")
+                summary = ', '.join(parts)
+                if len(summary) > max_len:
+                    summary = summary[:max_len - 3] + '...'
+                return summary
+        except (ValueError, TypeError):
+            pass
+
+        # 对被截断的 JSON，用正则提取关键信息
+        if 'todos' in desc:
+            count = desc.count("'content':")
+            return f"更新 {count} 个待办事项"
+        if 'todos' in desc.lower():
+            count = desc.count('content')
+            return f"更新待办事项列表"
+
+    # 默认截断
+    return desc[:max_len - 3] + '...'
+
+
+def _generate_thinking_chain(output, turn, turn_num):
+    """基于本轮工具调用自动推断思考链
+
+    由于脚本无法真正理解 AI 的思考过程，生成的思考链是基于工具调用模式的推断，
+    仅供参考，需人工审核。
+    """
+    tool_calls = turn['tool_calls']
+    user_text = '\n'.join(turn['user_lines'])[:200]
+
+    # 提取用户意图关键词
+    intent_keywords = []
+    if '查找' in user_text or '搜索' in user_text or '找到' in user_text:
+        intent_keywords.append('搜索/查找信息')
+    if '修复' in user_text or 'bug' in user_text.lower() or '错误' in user_text:
+        intent_keywords.append('修复问题')
+    if '创建' in user_text or '新增' in user_text or '添加' in user_text:
+        intent_keywords.append('创建/新增功能')
+    if '更新' in user_text or '修改' in user_text:
+        intent_keywords.append('更新/修改现有内容')
+    if '检查' in user_text or '确认' in user_text or '验证' in user_text:
+        intent_keywords.append('检查/验证')
+    if '保存' in user_text or '记录' in user_text:
+        intent_keywords.append('保存/记录')
+    if not intent_keywords:
+        intent_keywords.append('执行用户请求的任务')
+
+    # 1. 需求分析
+    output.append(f"1. **需求分析**：")
+    output.append(f"   - 用户意图：{'、'.join(intent_keywords)}")
+
+    # 2. 方案制定（基于工具类型推断）
+    tool_types = set(tc[0] for tc in tool_calls)
+    if 'Agent' in tool_types or 'Task' in str(tool_types):
+        approach = '使用子代理（Agent）并行处理，提高效率'
+    elif len(tool_calls) > 5:
+        approach = '分步骤执行，先收集信息再综合处理'
+    elif 'Read' in tool_types and ('Edit' in tool_types or 'Write' in tool_types):
+        approach = '先读取现有内容，再进行编辑/写入'
+    elif 'Bash' in tool_types:
+        approach = '通过命令行工具执行操作'
+    else:
+        approach = '直接处理用户请求'
+    output.append(f"2. **方案制定**：{approach}")
+
+    # 3. 工具选择
+    if tool_calls:
+        output.append(f"3. **工具选择**：")
+        for tool_name, _ in tool_calls[:5]:
+            output.append(f"   - 使用 `{tool_name}` 工具")
+        if len(tool_calls) > 5:
+            output.append(f"   - ...及其他 {len(tool_calls) - 5} 个工具调用")
+    else:
+        output.append(f"3. **工具选择**：本轮无工具调用，直接回复")
+
+    # 4. 执行验证
+    if turn['doc_outputs']:
+        output.append(f"4. **执行验证**：")
+        output.append(f"   - 产出了 {len(turn['doc_outputs'])} 个文件变更")
+    elif tool_calls:
+        output.append(f"4. **执行验证**：")
+        output.append(f"   - 共执行 {len(tool_calls)} 个工具调用")
+    else:
+        output.append(f"4. **执行验证**：直接给出回复")
 
 
 def infer_rules_refs(topic):
@@ -258,6 +439,7 @@ def format_session(extract_file, date, seq, topic, jsonl_id, sessions_dir, outpu
         jsonl_full_path = _find_jsonl_path(jsonl_id)
         if jsonl_full_path:
             parts.append(f"**jsonl路径**: {jsonl_full_path}")
+    parts.append(f"**保存模式**: 完整模式（必须从 jsonl 提取完整对话内容）")
     parts.append("")
 
     # 一、会话概述

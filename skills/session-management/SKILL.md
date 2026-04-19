@@ -1,6 +1,7 @@
 ---
 name: session-management
 description: 会话管理技能。用于以下场景：(1) 保存会话记录，(2) 更新文档索引，(3) 管理会话历史。触发词：session-management、会话保存、保存会话、结束会话。CRITICAL级别：会话结束时自动执行。
+user-invocable: true
 ---
 
 # 会话保存与文档管理技能
@@ -28,9 +29,9 @@ description: 会话管理技能。用于以下场景：(1) 保存会话记录，
 |:-----|:-----|:-----------------|
 | openspec/**/*.md | 工作文档（需求/设计） | ai-docs-list.md 第2节 |
 | .claude/skills/*/SKILL.md | 技能文档 | ai-docs-list.md 第3节, CLAUDE.md 8.3节 |
-| .claude/prompts/**/*.md | 提示词文档 | ai-docs-list.md 第4节, CLAUDE.md |
+| .claude/prompts/**/*.md | 提示词文档（预留，当前无内容） | ai-docs-list.md 第4节, CLAUDE.md |
 | rules/**/*.md | 规则文档 | ai-docs-list.md 第5节, CLAUDE.md 8.2节 |
-| context/**/*.md | 知识文档 | ai-docs-list.md 第6节, CLAUDE.md 8.1节 |
+| context/**/*.md | 知识文档（预留，当前无内容） | ai-docs-list.md 第6节, CLAUDE.md 8.1节 |
 | CLAUDE.md | 主入口文件 | ai-docs-list.md |
 
 ### 1.3. 手动触发
@@ -49,6 +50,45 @@ hooks.json 配置了 PostToolUse + matcher: "Write|Edit" 提醒：
 ---
 
 ## 2. 执行流程
+
+### 步骤0：已保存会话去重（V3.6 新增）
+
+> **[CRITICAL]** 在开始处理前，必须先检查哪些会话已被保存过，**禁止重复分析已保存的 jsonl**。
+
+**去重方法**：
+
+```
+1. 扫描 ~/.claude/sessions/ 下所有 .md 文件
+2. 从每个 .md 文件头部提取 jsonl来源（session-id）
+3. 构建已保存的 session-id 集合
+4. 只处理未保存的会话
+```
+
+**提取 session-id 的方法**：
+
+```bash
+# 从所有会话记录中提取已保存的 session-id
+grep -rh '^\*\*jsonl来源\*\*: ' ~/.claude/sessions/ | sed 's/.*: //' | sed 's/\.jsonl//' | sort -u
+```
+
+**批量保存时的去重流程**：
+
+```
+1. 列出所有待保存的 jsonl 文件
+2. 提取已保存的 session-id 集合
+3. 对比两个列表，筛选出未保存的会话
+4. 只对未保存的会话执行步骤1-6
+5. 输出：已保存 N 个，跳过 M 个（已存在）
+```
+
+**已保存会话记录的完整性判断**：
+
+> 如果某个 .md 文件只有头部（文件大小 < 1KB），视为保存不完整，需要重新保存。
+
+```bash
+# 找出保存不完整的会话记录（小于1KB）
+find ~/.claude/sessions/ -name "*.md" -size -1k
+```
 
 ### 步骤1：读取上次会话记录（变更检测基准）
 
@@ -80,6 +120,215 @@ hooks.json 配置了 PostToolUse + matcher: "Write|Edit" 提醒：
 # 提取所有被 Edit/Write 的文件路径
 grep -o '"file_path":"[^"]*"' ~/.claude/projects/<project-id>/<session-id>.jsonl | sort -u
 ```
+
+### 步骤2.5：AI体系文档优化审计（条件触发）
+
+> **[IMPORTANT]** 本步骤是条件触发的，不是每次会话都执行。审计使用纯规则引擎检测（路径存在性、标题匹配等），不消耗 LLM 资源。
+
+**2.5.1. 触发条件**
+
+满足以下**任一**条件时执行审计：
+
+| 条件 | 判断方法 |
+|:-----|:---------|
+| 本次会话有AI体系文档变更 | 步骤2已标记（`.claude/skills/`、`rules/`、`CLAUDE.md`等） |
+| 会话持续时间超过60分钟 | jsonl文件首末消息时间差 |
+| 距上次审计超过5次会话 | 对比 `audit-todos.json` 中的 `last_audit_session` |
+| 用户提及文档优化关键词 | 用户消息包含"文档优化"、"文档整理"、"文档审计"等 |
+| 新增了技能或规则文件 | 步骤2变更清单含 `skills/*/SKILL.md` 或 `rules/*.md` |
+
+不触发时输出：`[步骤2.5] 审计条件未满足，跳过`
+
+**2.5.2. 检测规则引擎**
+
+执行以下规则，每条规则独立产出一条审计结果：
+
+| 规则ID | 规则名称 | 检测方法 | 优先级 |
+|:-------|:---------|:---------|:-------|
+| A01 | 引用文件缺失 | 遍历SKILL.md中引用的文件路径（如 `ai-docs-list.md`），检查是否存在 | HIGH |
+| A02 | 章节引用悬空 | 检查SKILL.md中引用的章节编号（如"8.3节"）在目标文件中是否存在 | HIGH |
+| A03 | 文档内容重复 | 检查CLAUDE.md与 `rules/*.md` 之间是否存在相同标题的规则条目 | LOW |
+| A04 | 索引文件过期 | 检查 `skills/README.md` 技能清单与 `skills/*/SKILL.md` 实际文件是否一致 | MEDIUM |
+| A05 | 目录结构缺失 | 检查SKILL.md引用的目录（`prompts/`、`context/`等）是否存在。**豁免**：1.2节表格中标注"预留"的目录不视为缺失 | MEDIUM |
+| A06 | 版本号不一致 | 检查SKILL.md版本历史最新版本与README.md中标注的版本是否一致 | LOW |
+| A07 | 权限配置过时 | 检查 `settings.json` 权限是否覆盖SKILL.md第5节必需权限 | MEDIUM |
+| A08 | 脚本引用验证 | 检查SKILL.md中引用的脚本路径是否在 `scripts/` 目录下实际存在 | MEDIUM |
+
+**2.5.3. 检测执行方法**
+
+```
+[ ] 读取审计todo文件：~/.claude/audit-todos.json（如不存在则创建空文件）
+[ ] 按规则ID顺序逐条执行检测
+[ ] 每条规则的检测结果格式化为审计条目
+[ ] 将新发现的审计条目追加到 audit-todos.json
+[ ] 去重：相同 rule_id + target_path 的条目不重复添加，仅更新 created_at
+```
+
+**A01/A08 检测示例**：
+```bash
+# A01: 检查引用文件是否存在
+grep -oP '(?<=`)[^`]*\.md(?=`)' ~/.claude/skills/session-management/SKILL.md | while read f; do
+  [ ! -f "$f" ] && echo "A01:MISSING:$f"
+done
+
+# A08: 检查脚本路径是否存在
+grep -oP '~/.claude/skills/[^/ ]+/scripts/[^\s`)]+\.py' ~/.claude/skills/session-management/SKILL.md | while read f; do
+  [ ! -f "$f" ] && echo "A08:MISSING:$f"
+done
+```
+
+**2.5.4. 审计结果输出格式**
+
+每条审计条目遵循以下JSON格式（写入 `audit-todos.json`）：
+
+```json
+{
+  "id": "A01-001",
+  "rule_id": "A01",
+  "priority": "HIGH",
+  "target_path": "ai-docs-list.md",
+  "description": "SKILL.md引用的 ai-docs-list.md 文件不存在",
+  "suggestion": "创建 ai-docs-list.md 或移除SKILL.md中的引用",
+  "status": "OPEN",
+  "type": "IMMEDIATE",
+  "created_at": "2026-04-19",
+  "created_in_session": "01-XXX",
+  "resolved_at": null
+}
+```
+
+**2.5.5. IMMEDIATE vs DEFERRED 处理**
+
+| 类型 | 含义 | 处理方式 |
+|:-----|:-----|:---------|
+| IMMEDIATE | 文档结构性问题，应尽快修复 | 写入验证报告第7项，提醒用户确认是否立即修复 |
+| DEFERRED | 优化改进项，可在后续会话中处理 | 仅写入 `audit-todos.json`，下次审计时累积提醒 |
+
+**优先级与类型的映射**：
+- HIGH 优先级 → IMMEDIATE
+- MEDIUM / LOW 优先级 → DEFERRED（用户可在审计todo中手动升级为 IMMEDIATE）
+
+**2.5.6. 累积提醒机制**
+
+每次执行审计时，输出累积统计：
+
+```
+[步骤2.5] 审计结果：
+  本次新发现：2条（IMMEDIATE: 1, DEFERRED: 1）
+  历史未解决：5条（IMMEDIATE: 2, DEFERRED: 3）
+  已解决：3条
+```
+
+IMMEDIATE 未解决条目超过3条时，输出警告：
+```
+[WARNING] 积累 IMMEDIATE 审计条目已达 N 条，建议安排专门会话处理。
+```
+
+**audit-todos.json 文件格式**：
+
+```json
+{
+  "meta": {
+    "version": "1.0",
+    "last_audit_date": null,
+    "last_audit_session": null,
+    "total_created": 0,
+    "total_resolved": 0
+  },
+  "items": []
+}
+```
+
+**条目生命周期**：
+```
+OPEN --[用户或AI修复]--> RESOLVED
+OPEN --[用户标记不修复]--> CLOSED
+OPEN --[下次审计仍检测到]--> 保持OPEN（去重，更新created_at）
+```
+
+**2.5.7 会话内容语义审计（核心能力）**
+
+> **[CRITICAL]** 这是审计的核心能力。在读取被保存会话的 jsonl 内容时，同步分析对话中的执行过程，识别技能/规则/提示词的缺陷和优化机会。
+
+**检测模式**（7种，覆盖技能执行全生命周期）：
+
+| 模式ID | 模式名称 | 检测方法 | 优先级 | 涉及目标 |
+|:-------|:---------|:---------|:-------|:---------|
+| S01 | 技能执行失败/绕行 | 会话中 AI 执行某技能时遇到错误，不得不绕过或手动替代 | HIGH | skills/*/SKILL.md |
+| S02 | 脚本缺陷 | 会话中调用的 .py 脚本报错、输出错误、或需要手动修补 | HIGH | skills/*/scripts/*.py |
+| S03 | 用户多次纠正同类错误 | 用户在同一会话中 2 次以上纠正 AI 的同类行为 | HIGH | rules/*.md, CLAUDE.md |
+| S04 | 规则违反 | AI 执行了 rules 中明确禁止的操作（如未授权 git、sed 处理中文等） | HIGH | rules/*.md |
+| S05 | 规则缺失 | AI 不得不自行判断某事，而此事应有明确规则但当前没有 | MEDIUM | rules/*.md, CLAUDE.md |
+| S06 | 知识缺失 | AI 多次搜索/查阅同一外部信息，说明该知识应预置到 context/ 或 rules/ | MEDIUM | context/*.md, rules/*.md |
+| S07 | 重复低效模式 | 同一手动绕行方式在多个会话中出现（对比 audit-todos.json 历史条目） | MEDIUM | skills/*/SKILL.md |
+
+**执行方法**：
+
+在步骤5（读取 jsonl 提取对话内容）的过程中，AI 同步进行以下分析：
+
+```
+[ ] 逐轮阅读对话内容，标记以下事件：
+    - AI 报错/异常（S01, S02）
+    - 用户纠正 AI 的内容（S03, S04）
+    - AI 表示不确定/需要猜测/自行判断（S05）
+    - AI 多次搜索同一主题（S06）
+[ ] 将标记的事件与检测模式匹配
+[ ] 每个匹配事件格式化为审计条目
+[ ] 对比 audit-todos.json 历史条目，识别重复模式（S07）
+[ ] 去重后写入 audit-todos.json
+```
+
+**审计条目格式示例**：
+
+```json
+{
+  "id": "S01-002",
+  "rule_id": "S01",
+  "priority": "HIGH",
+  "target_path": "skills/session-management/SKILL.md",
+  "description": "会话 39be2988 中，3fb55f2e（438行）写入时 API 超限，AI 手动分段处理但技能无此策略",
+  "suggestion": "在 SKILL.md 步骤5.1 中增加大文件分段写入策略：超过200行的会话记录分2-3次写入",
+  "source_session": "39be2988-bf0f-4f68-82ef-686aff2c34d5",
+  "source_round": "第3轮",
+  "status": "OPEN",
+  "type": "IMMEDIATE",
+  "created_at": "2026-04-19",
+  "created_in_session": "02-批量会话保存与记录整改",
+  "resolved_at": null
+}
+```
+
+**与静态检查（A01-A08）的关系**：
+
+```
+步骤2.5 审计 = 静态检查（A01-A08）+ 语义审计（S01-S07）
+                ↓                      ↓
+         检查文档是否"结构正确"     检查文档是否"内容有效"
+         不需要读会话内容            必须读会话内容
+         规则引擎（零成本）          需要 LLM 分析
+```
+
+两者互补：
+- A01-A08 发现"文件缺失"、"版本不一致"等结构性问题
+- S01-S07 发现"技能步骤有漏洞"、"规则不够明确"等内容性问题
+
+**IMMEDIATE vs DEFERRED 判定**：
+
+| 模式 | 默认类型 | 理由 |
+|:-----|:---------|:-----|
+| S01 技能执行失败 | IMMEDIATE | 技能缺陷直接影响后续使用 |
+| S02 脚本缺陷 | IMMEDIATE | 脚本 bug 会导致自动化失败 |
+| S03 用户多次纠正 | IMMEDIATE | 用户反复纠正说明规则严重缺失 |
+| S04 规则违反 | IMMEDIATE | 违反规则是严重问题 |
+| S05 规则缺失 | DEFERRED | 新规则建议可延后讨论 |
+| S06 知识缺失 | DEFERRED | 知识补充可批量处理 |
+| S07 重复低效模式 | DEFERRED | 优化改进项 |
+
+**交叉引用全局规则**：
+
+> 语义审计发现规则缺失（S05）或重复低效模式（S07）时，**必须先检查 `rules/global-mandatory-rules.md` 是否已有覆盖**。
+> 特别是第9节"实现质量强制规则"（9.1需求对齐、9.2先验证再实施、9.3实现确认）已覆盖常见模式。
+> 只有在全局规则确实未覆盖时，才创建新的审计条目。
 
 ### 步骤3：更新AI体系文档索引（如有变更）
 
@@ -680,6 +929,12 @@ python ~/.claude/skills/session-management/scripts/fix-session-format.py --fix-a
    [ ] 工具调用示例是否每轮都有（无工具调用则写"本轮无工具调用"）？
    [ ] 是否包含所有用户输入？
    [ ] 是否包含变更文件清单（绝对路径）？
+7. 文档审计（步骤2.5）：
+   - 审计执行：已执行 / 条件未满足跳过
+   - 本次新发现：[N]条（IMMEDIATE: [N], DEFERRED: [N]）
+   - 历史未解决：[N]条（IMMEDIATE: [N], DEFERRED: [N]）
+   - IMMEDIATE条目详情：[列表或"无"]
+   - audit-todos.json：已更新 / 未变更
 ```
 
 **验证报告判定规则**：
@@ -693,6 +948,8 @@ python ~/.claude/skills/session-management/scripts/fix-session-format.py --fix-a
 | 思考链使用通用占位符 | **必须替换为实际内容后再保存** |
 | 工具调用示例整节缺失 | **必须补全后再保存** |
 | 变更文件清单缺失 | 警告，补充后保存 |
+| 审计新发现IMMEDIATE条目 | 提醒用户，不阻止保存 |
+| IMMEDIATE未解决超过3条 | 警告，建议安排专门会话 |
 
 **V2.8要求（验证报告完整性）**：
 
@@ -767,6 +1024,9 @@ python ~/.claude/skills/session-management/scripts/fix-session-format.py --fix-a
 
 | 版本 | 日期 | 变更说明 |
 |:-----|:-----|:---------|
+| V3.7 | 2026-04-19 | **[FIX]** A05规则增加预留目录豁免机制（prompts/、context/标注为预留，不视为缺失）；1.2节表格增加"预留"标注；语义审计增加交叉引用全局规则说明（S05/S07先检查 global-mandatory-rules.md 是否已覆盖） |
+| V3.6 | 2026-04-19 | **[FEATURE]** 新增步骤0"已保存会话去重"：批量保存时扫描 sessions/ 提取已保存 session-id 集合，跳过已保存的会话，识别不完整记录（<1KB）需重新保存；settings.local.json 权限从29条一次性命令精简为20条通用模式权限 |
+| V3.5 | 2026-04-19 | **[FEATURE]** 新增步骤2.5"AI体系文档优化审计"：条件触发（5种触发条件）、静态检查规则引擎（A01-A08，文件/目录/版本/权限结构检查）、会话内容语义审计（S01-S07，从会话对话中识别技能缺陷/规则违反/知识缺失等优化机会）；IMMEDIATE/DEFERRED双轨处理、audit-todos.json持久化、累积提醒机制；验证报告新增第7项审计检查 |
 | V3.4 | 2026-04-18 | **[FEATURE]** 新增5.3.1.1轮次合并规则：jsonl中tool_result链必须与前轮用户消息合并，禁止拆分为独立轮次；新增5.3.7系统注入消息过滤规范（上下文续接、空tool_result等必须过滤）；新增5.5格式检查与修复（check-session-completeness.py支持--format参数，新增fix-session-format.py修复脚本） |
 | V3.3 | 2026-04-13 | **[CRITICAL]** 移除场景A/B区分，所有会话保存统一使用完整模式（必须从 jsonl 提取完整对话内容）；步骤2 变更检测改为从 jsonl 提取 Edit/Write 路径，禁止使用 git diff；新增跨天会话目录规则（使用 jsonl 创建日期）；format_sessions.py 新增 --auto-date + _get_single_birth_time() |
 | V3.1 | 2026-04-11 | **[FEATURE]** 新增每日会话序号前缀：按当天在该项目路径**打开**Claude会话的绝对顺序编号（01, 02, ...），文件名格式改为 `[序号]-[主题].md`；序号通过 jsonl 文件创建时间排序确定，与保存顺序无关；新增 scripts/format_sessions.py 批量格式化工具 |
@@ -806,6 +1066,7 @@ python ~/.claude/skills/session-management/scripts/fix-session-format.py --fix-a
 | 权限规则 | 用途 |
 |:---------|:-----|
 | `Write(~/.claude/sessions/**)` | 创建会话记录文件 |
+| `Write(~/.claude/audit-todos.json)` | 创建/更新审计todo持久化文件 |
 
 **Edit（编辑）**:
 | 权限规则 | 用途 |
