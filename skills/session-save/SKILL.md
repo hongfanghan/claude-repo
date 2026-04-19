@@ -190,6 +190,36 @@ python ${CLAUDE_SKILL_DIR}/scripts/check-session-completeness.py --check-all --f
 python ${CLAUDE_SKILL_DIR}/scripts/fix-session-format.py <session_md_file>
 ```
 
+**5.6. 上下文窗口保护规则**
+
+> **[CRITICAL]** 多会话保存时，并行 agent 输出会快速消耗主会话上下文，导致 context window 超限崩溃。必须严格遵守以下规则。
+
+**并行 agent 数量限制**：
+
+| 需保存会话数 | agent 并行策略 | 说明 |
+|:------------|:-------------|:-----|
+| 1-2个 | 最多并行2个 | 直接并行即可 |
+| 3个及以上 | **串行执行** | 逐个启动 agent，完成后处理下一个 |
+
+**串行执行流程**（需保存 ≥ 3个会话时）：
+```
+1. 启动第1个 agent（run_in_background: true）
+2. TaskOutput 等待完成 → 确认结果 → 继续下一步
+3. 启动第2个 agent（run_in_background: true）
+4. TaskOutput 等待完成 → 确认结果 → 继续下一步
+5. ... 依此类推
+```
+
+**agent prompt 精简要求**：
+- agent prompt 中**不要**传入完整的 jsonl 提取内容
+- 只传入：已有 md 路径、jsonl 路径、需要追加的行号范围
+- agent 只返回“成功/失败 + 简要摘要（1-2句话）”
+
+**禁止行为**：
+- 一次性并行启动 ≥ 3个 agent
+- 在 agent prompt 中传入大量文本（提取内容、完整对话等）
+- 多个 TaskOutput 结果同时存在于主会话上下文中
+
 ### 步骤6：输出验证报告
 
 ```
@@ -242,6 +272,7 @@ python ${CLAUDE_SKILL_DIR}/scripts/fix-session-format.py <session_md_file>
 
 | 版本 | 日期 | 变更说明 |
 |:-----|:-----|:---------|
+| V4.2 | 2026-04-20 | 新增步骤5.6上下文窗口保护规则：限制并行agent数量≤2，≥3个时串行执行，agent prompt精简要求 |
 | V4.1 | 2026-04-20 | 步骤0去重机制优化：基于 jsonl 行号比较判断记录完整性，有新增则查漏补缺 |
 | V4.0 | 2026-04-20 | 从 session-management 拆分独立；新增步骤0.5时间范围筛选；移除审计功能 |
 | V3.7 | 2026-04-19 | A05规则增加预留目录豁免 |
