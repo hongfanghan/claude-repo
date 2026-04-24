@@ -21,7 +21,7 @@ import sys
 import os
 import json
 import argparse
-from pypdf import PdfMerger, PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter
 
 
 def url_path_to_parts(url_path):
@@ -46,7 +46,7 @@ def merge_with_toc_and_bookmarks(page_list, output_path):
     page_list 每个元素：
     {
         "url_path": "en/agent-sdk/overview",
-        "pdf_path": "pages/en/agent-sdk/overview.pdf",
+        "pdf_file": "pages/en/agent-sdk/overview.pdf",
         "title": "Agent SDK 概述"
     }
     """
@@ -54,10 +54,14 @@ def merge_with_toc_and_bookmarks(page_list, output_path):
     toc_entries = []  # 目录项：(层级, 标题, 页码)
     page_num = 0
 
+    # 确定基准目录（manifest 所在目录）
+    base_dir = os.path.dirname(os.path.abspath(output_path))
+
     # 第一遍：计算每页 PDF 的页数，建立页码映射
     pdf_page_counts = []
     for page in page_list:
-        pdf_path = page["pdf_path"]
+        pdf_file = page.get("pdf_file", page.get("pdf_path", ""))
+        pdf_path = os.path.join(base_dir, pdf_file) if pdf_file and not os.path.isabs(pdf_file) else pdf_file
         if not os.path.exists(pdf_path):
             pdf_page_counts.append(0)
             continue
@@ -76,7 +80,8 @@ def merge_with_toc_and_bookmarks(page_list, output_path):
     page_bookmarks = []  # (层级, 标题, 页码, 父级路径)
 
     for i, page in enumerate(page_list):
-        pdf_path = page["pdf_path"]
+        pdf_file = page.get("pdf_file", page.get("pdf_path", ""))
+        pdf_path = os.path.join(base_dir, pdf_file) if pdf_file and not os.path.isabs(pdf_file) else pdf_file
         if not os.path.exists(pdf_path):
             continue
 
@@ -341,15 +346,17 @@ body {{
 
 def merge_pdfs_simple(pdf_paths, output_path):
     """简单合并多个 PDF（无书签）"""
-    merger = PdfMerger()
+    writer = PdfWriter()
     for path in pdf_paths:
         if os.path.exists(path):
-            merger.append(path)
+            reader = PdfReader(path)
+            for page in reader.pages:
+                writer.add_page(page)
         else:
             print(f"警告：跳过不存在的文件 {path}")
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    merger.write(output_path)
-    merger.close()
+    writer.write(output_path)
+    writer.close()
 
 
 def main():

@@ -1,6 +1,7 @@
 ---
 name: web-translate-pdf
 description: "将目标网站页面抓取并输出高清离线 PDF。支持两种模式：①直接抓取目标语言页面（如 zh-CN）②抓取后翻译为中文。下载高清图片嵌入 PDF、保持原网站目录结构和样式、层级书签导航。当用户要求网站转PDF、网页转PDF、网站内容中文化、翻译网站时触发本技能。"
+user-invocable: true
 license: Proprietary. LICENSE.txt has complete terms
 allowed-tools:
   - Read

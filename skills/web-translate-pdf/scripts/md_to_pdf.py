@@ -212,62 +212,114 @@ def _svg_to_png_base64(svg_content, max_width=800):
     return None
 
 
-def download_image_to_base64(url, timeout=60):
-    """下载远程图片并转为 base64 data URL。SVG 自动转 PNG 确保渲染。"""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        resp = requests.get(url, timeout=timeout, headers=headers)
-        if resp.status_code == 200:
-            content_type = resp.headers.get("Content-Type", "")
-            # 从 URL 推断 MIME 类型
-            ext = url.rsplit(".", 1)[-1].split("?")[0].split("#")[0].lower()
-            if not content_type or "image" not in content_type:
-                mime_map = {
-                    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
-                    "ico": "image/x-icon", "avif": "image/avif"
-                }
-                content_type = mime_map.get(ext, "image/png")
+def _get_referer_for_url(url):
+    """根据图片URL域名自动推断Referer头（防盗链绕过）"""
+    from urllib.parse import urlparse
+    host = urlparse(url).hostname or ""
+    referer_map = {
+        "i.qbitai.com": "https://www.qbitai.com/",
+        "cdn.pingwest.com": "https://www.pingwest.com/",
+        "simg.baai.ac.cn": "https://hub.baai.ac.cn/",
+        "np-newspic.dfcfw.com": "https://www.eastmoney.com/",
+        "doc-fd.zol-img.com.cn": "https://www.zol.com.cn/",
+        "mmbiz.qpic.cn": "https://mp.weixin.qq.com/",
+        "static.leiphone.com": "https://www.leiphone.com/",
+    }
+    for domain, referer in referer_map.items():
+        if domain in host:
+            return referer
+    # GitHub 相关域名：使用 github.com 作为 referer
+    if "github" in host or "githubusercontent" in host:
+        return "https://github.com/"
+    return None
 
-            # SVG 特殊处理：转为 PNG 再嵌入，避免 Playwright PDF 渲染为微小图标
-            if "svg" in content_type or ext == "svg":
-                png_url = _svg_to_png_base64(resp.content)
-                if png_url:
-                    print(f"  SVG→PNG 转换成功 ({len(resp.content)} bytes SVG)")
-                    return png_url
-                # 转换失败，降级为直接嵌入 SVG
-                print(f"  SVG→PNG 转换失败，降级直接嵌入 SVG")
 
-            b64 = base64.b64encode(resp.content).decode("ascii")
-            return f"data:{content_type};base64,{b64}"
-    except Exception as e:
-        print(f"  图片下载失败: {url[:80]}... ({e})")
+def download_image_to_base64(url, timeout=60, max_retries=2):
+    """下载远程图片并转为 base64 data URL。SVG 自动转 PNG 确保渲染。支持Referer防盗链和重试。"""
+    import time
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    # 自动添加 Referer
+    referer = _get_referer_for_url(url)
+    if referer:
+        headers["Referer"] = referer
+
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            if resp.status_code == 200:
+                content_type = resp.headers.get("Content-Type", "")
+                # 检查是否实际返回了图片（而非HTML/纯文本）
+                if resp.content and len(resp.content) > 100:
+                    if "text/html" in content_type:
+                        # 可能是防盗链返回的错误页面，跳过
+                        print(f"  图片下载返回HTML（可能防盗链）: {url[:80]}...")
+                        return None
+                    # 从 URL 推断 MIME 类型
+                    ext = url.rsplit(".", 1)[-1].split("?")[0].split("#")[0].lower()
+                    if not content_type or "image" not in content_type:
+                        mime_map = {
+                            "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                            "gif": "image/gif", "svg": "image/svg+xml", "webp": "image/webp",
+                            "ico": "image/x-icon", "avif": "image/avif"
+                        }
+                        content_type = mime_map.get(ext, "image/png")
+
+                    # SVG 特殊处理：转为 PNG 再嵌入，避免 Playwright PDF 渲染为微小图标
+                    if "svg" in content_type or ext == "svg":
+                        png_url = _svg_to_png_base64(resp.content)
+                        if png_url:
+                            print(f"  SVG→PNG 转换成功 ({len(resp.content)} bytes SVG)")
+                            return png_url
+                        print(f"  SVG→PNG 转换失败，降级直接嵌入 SVG")
+
+                    b64 = base64.b64encode(resp.content).decode("ascii")
+                    return f"data:{content_type};base64,{b64}"
+                elif resp.content and len(resp.content) <= 100:
+                    print(f"  图片内容过小（{len(resp.content)} bytes），可能已失效: {url[:80]}...")
+                    return None
+            elif resp.status_code == 403:
+                print(f"  图片下载403（防盗链）: {url[:80]}...")
+                return None
+            elif resp.status_code == 404:
+                print(f"  图片下载404（不存在）: {url[:80]}...")
+                return None
+        except Exception as e:
+            if attempt < max_retries:
+                print(f"  图片下载失败（第{attempt+1}次），{2}秒后重试: {url[:80]}... ({e})")
+                time.sleep(2)
+                continue
+            print(f"  图片下载失败（已重试{max_retries}次）: {url[:80]}... ({e})")
     return None
 
 
 def download_image_to_file(url, save_dir, timeout=60):
     """下载远程图片到本地文件，返回本地路径"""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        resp = requests.get(url, timeout=timeout, headers=headers)
-        if resp.status_code == 200:
-            # 推断扩展名
-            ext = url.rsplit(".", 1)[-1].split("?")[0].split("#")[0].lower()
-            valid_exts = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "avif"}
-            if ext not in valid_exts:
-                ext = "png"
-            h = hashlib.md5(url.encode()).hexdigest()[:12]
-            path = os.path.join(save_dir, f"{h}.{ext}")
-            if not os.path.exists(path):
-                with open(path, "wb") as f:
-                    f.write(resp.content)
-            return path
-    except Exception:
-        pass
+    import time
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+    referer = _get_referer_for_url(url)
+    if referer:
+        headers["Referer"] = referer
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, timeout=timeout, headers=headers)
+            if resp.status_code == 200 and resp.content and len(resp.content) > 100:
+                ext = url.rsplit(".", 1)[-1].split("?")[0].split("#")[0].lower()
+                valid_exts = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "avif"}
+                if ext not in valid_exts:
+                    ext = "png"
+                h = hashlib.md5(url.encode()).hexdigest()[:12]
+                path = os.path.join(save_dir, f"{h}.{ext}")
+                if not os.path.exists(path):
+                    with open(path, "wb") as f:
+                        f.write(resp.content)
+                return path
+        except Exception:
+            if attempt < 2:
+                time.sleep(2)
     return None
 
 
@@ -300,9 +352,11 @@ def embed_images_in_md(content_md, images_dir, use_base64=True):
                 abs_path = os.path.abspath(local_path)
                 return f"{prefix}file:///{abs_path.replace(os.sep, '/')}{suffix}"
 
-        # 下载失败，保留原 URL
-        print(f"  图片保留原URL: {url[:80]}...")
-        return match.group(0)
+        # 下载失败，替换为占位符避免 networkidle 超时
+        print(f"  图片下载失败，使用占位符: {url[:80]}...")
+        alt_text = re.search(r'alt=["\']([^"\']*)["\']', match.group(0))
+        alt = alt_text.group(1) if alt_text else "图片"
+        return f"{prefix}data:image/svg+xml;base64,{base64.b64encode(f'<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"400\" height=\"60\"><rect width=\"100%\" height=\"100%\" fill=\"#f3f4f6\"/><text x=\"50%\" y=\"50%\" text-anchor=\"middle\" dominant-baseline=\"middle\" font-size=\"14\" fill=\"#9ca3af\">[图片加载失败: {alt}]</text></svg>'.encode()).decode()}{suffix}"
 
     return re.sub(pattern, replacer, content_md)
 
@@ -463,7 +517,7 @@ def html_to_pdf(html_content, output_path):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.set_content(html_content, wait_until="networkidle")
+        page.set_content(html_content, wait_until="networkidle", timeout=60000)
         page.pdf(
             path=output_path,
             format="A4",
